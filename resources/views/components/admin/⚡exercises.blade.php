@@ -3,6 +3,8 @@
 
 use App\Models\Category;
 use App\Models\Exercise;
+use App\Models\LearningPathChapter;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Livewire\Component;
 
@@ -12,27 +14,101 @@ new class extends Component
 
     public string $title = '';
     public string $description = '';
+    public array $hints = [];
+    public string $success_explanation = '';
     public string $difficulty = 'easy';
     public int $xp_reward = 10;
     public string $starter_code = '';
+    public string $chapter_id = '';
+    public array $prerequisiteIds = [];
     public int $category_id = 0;
     public string $language = 'javascript';
     public bool $is_published = false;
     public int $sort_order = 0;
+    public array $testCases = [];
 
     public function save()
     {
+        $this->resetValidation();
+
         $validated = $this->validate([
             'title' => ['required', 'string', 'max:255'],
             'description' => ['required', 'string'],
+            'hints' => ['array', 'max:5'],
+            'hints.*' => ['nullable', 'string', 'max:500'],
+            'success_explanation' => ['nullable', 'string', 'max:5000'],
             'difficulty' => ['required', 'in:easy,medium,hard,expert'],
             'xp_reward' => ['required', 'integer', 'min:1'],
             'starter_code' => ['nullable', 'string'],
+            'chapter_id' => ['nullable', 'integer', 'exists:learning_path_chapters,id'],
+            'prerequisiteIds' => ['array', 'max:20'],
+            'prerequisiteIds.*' => ['required', 'integer', 'distinct', 'exists:exercises,id'],
             'category_id' => ['required', 'integer', 'exists:categories,id'],
             'language' => ['required', 'string', 'max:50'],
             'is_published' => ['boolean'],
             'sort_order' => ['required', 'integer', 'min:0'],
+            'testCases' => ['array', 'max:20'],
+            'testCases.*.input' => ['required', 'string', 'max:10000'],
+            'testCases.*.expected' => ['required', 'string', 'max:10000'],
+            'testCases.*.hidden' => ['boolean'],
         ]);
+
+        $prerequisiteIds = array_values(array_unique(array_map(
+            'intval',
+            $validated['prerequisiteIds'] ?? []
+        )));
+
+        if ($this->editingId && in_array($this->editingId, $prerequisiteIds, true)) {
+            $this->addError('prerequisiteIds', 'Un exercice ne peut pas dépendre de lui-même.');
+            return;
+        }
+
+        if ($prerequisiteIds !== [] && Exercise::query()
+            ->whereIn('id', $prerequisiteIds)
+            ->where('is_published', true)
+            ->count() !== count($prerequisiteIds)) {
+            $this->addError('prerequisiteIds', 'Les prérequis doivent être des exercices publiés.');
+            return;
+        }
+
+        if ($this->editingId && $this->hasCircularPrerequisite($this->editingId, $prerequisiteIds)) {
+            $this->addError('prerequisiteIds', 'Cette sélection créerait une boucle de prérequis.');
+            return;
+        }
+
+        $validated['learning_path_chapter_id'] = ($validated['chapter_id'] ?? null) ?: null;
+        unset($validated['chapter_id'], $validated['prerequisiteIds']);
+        $validated['hints'] = $validated['hints'] ?? [];
+        $validated['hints'] = array_values(array_filter(
+            array_map(fn ($hint) => trim((string) $hint), $validated['hints']),
+            fn ($hint) => $hint !== ''
+        ));
+
+        $testCases = [];
+
+        foreach ($validated['testCases'] as $index => $testCase) {
+            $input = json_decode($testCase['input'], true);
+            $inputError = json_last_error();
+            $expected = json_decode($testCase['expected'], true);
+            $expectedError = json_last_error();
+
+            if ($inputError !== JSON_ERROR_NONE) {
+                $this->addError("testCases.$index.input", 'Les données d’entrée doivent être au format JSON valide.');
+                return;
+            }
+
+            if ($expectedError !== JSON_ERROR_NONE) {
+                $this->addError("testCases.$index.expected", 'Le résultat attendu doit être au format JSON valide.');
+                return;
+            }
+
+            $testCases[] = [
+                'input_data' => $input,
+                'expected_output' => $expected,
+                'is_hidden' => (bool) ($testCase['hidden'] ?? false),
+                'sort_order' => count($testCases),
+            ];
+        }
 
         $slug = Str::slug($validated['title']);
 
@@ -49,15 +125,95 @@ new class extends Component
 
         $validated['slug'] = $slug;
 
-        if ($this->editingId) {
-            Exercise::findOrFail($this->editingId)->update($validated);
-            session()->flash('success', 'Exercice modifié avec succès.');
-        } else {
-            Exercise::create($validated);
-            session()->flash('success', 'Exercice ajouté avec succès.');
+        $exercise = DB::transaction(function () use ($validated, $testCases, $prerequisiteIds) {
+            if ($this->editingId) {
+                $exercise = Exercise::findOrFail($this->editingId);
+                $exercise->update($validated);
+            } else {
+                $exercise = Exercise::create($validated);
+            }
+
+            $exercise->testCases()->delete();
+
+            foreach ($testCases as $testCase) {
+                $exercise->testCases()->create($testCase);
+            }
+            $exercise->prerequisites()->sync($prerequisiteIds);
+
+            return $exercise;
+        });
+
+        session()->flash(
+            'success',
+            $this->editingId
+                ? 'Exercice modifié avec succès.'
+                : 'Exercice ajouté avec succès.'
+        );
+        $this->resetForm();
+    }
+
+    public function addTestCase()
+    {
+        $this->testCases[] = [
+            'input' => '[]',
+            'expected' => 'null',
+            'hidden' => false,
+            'sort_order' => count($this->testCases),
+        ];
+    }
+
+    public function removeTestCase(int $index)
+    {
+        unset($this->testCases[$index]);
+        $this->testCases = array_values($this->testCases);
+    }
+
+    public function addHint(): void
+    {
+        if (count($this->hints) >= 5) {
+            $this->addError('hints', 'Un exercice peut contenir au maximum 5 indices.');
+            return;
         }
 
-        $this->resetForm();
+        $this->resetValidation('hints');
+        $this->hints[] = '';
+    }
+
+    public function removeHint(int $index): void
+    {
+        unset($this->hints[$index]);
+        $this->hints = array_values($this->hints);
+        $this->resetValidation('hints');
+    }
+
+    private function hasCircularPrerequisite(int $exerciseId, array $prerequisiteIds): bool
+    {
+        $pending = $prerequisiteIds;
+        $visited = [];
+
+        while ($pending !== []) {
+            $candidateId = (int) array_pop($pending);
+
+            if ($candidateId === $exerciseId) {
+                return true;
+            }
+
+            if (isset($visited[$candidateId])) {
+                continue;
+            }
+
+            $visited[$candidateId] = true;
+            $candidate = Exercise::find($candidateId);
+
+            if ($candidate) {
+                array_push(
+                    $pending,
+                    ...$candidate->prerequisites()->pluck('exercises.id')->map(fn ($id) => (int) $id)->all()
+                );
+            }
+        }
+
+        return false;
     }
 
     public function edit(int $id)
@@ -67,13 +223,30 @@ new class extends Component
         $this->editingId = $exercise->id;
         $this->title = $exercise->title;
         $this->description = $exercise->description;
+        $this->hints = $exercise->hints ?? [];
+        $this->success_explanation = $exercise->success_explanation ?? '';
         $this->difficulty = $exercise->difficulty;
         $this->xp_reward = $exercise->xp_reward;
         $this->starter_code = $exercise->starter_code ?? '';
+        $this->chapter_id = (string) ($exercise->learning_path_chapter_id ?? '');
+        $this->prerequisiteIds = $exercise->prerequisites()
+            ->pluck('exercises.id')
+            ->map(fn ($id) => (string) $id)
+            ->all();
         $this->category_id = $exercise->category_id;
         $this->language = $exercise->language;
         $this->is_published = $exercise->is_published;
         $this->sort_order = $exercise->sort_order;
+        $this->testCases = $exercise->testCases()
+            ->orderBy('sort_order')
+            ->get()
+            ->map(fn ($testCase) => [
+                'input' => json_encode($testCase->input_data, JSON_UNESCAPED_UNICODE),
+                'expected' => json_encode($testCase->expected_output, JSON_UNESCAPED_UNICODE),
+                'hidden' => $testCase->is_hidden,
+                'sort_order' => $testCase->sort_order,
+            ])
+            ->all();
     }
 
     public function togglePublication(int $id)
@@ -114,28 +287,47 @@ new class extends Component
             'editingId',
             'title',
             'description',
+            'hints',
+            'success_explanation',
             'difficulty',
             'xp_reward',
             'starter_code',
+            'chapter_id',
+            'prerequisiteIds',
             'category_id',
             'language',
             'is_published',
             'sort_order',
+            'testCases',
         ]);
 
         $this->difficulty = 'easy';
         $this->xp_reward = 10;
         $this->language = 'javascript';
+        $this->chapter_id = '';
         $this->is_published = false;
         $this->sort_order = 0;
+        $this->hints = [];
+        $this->prerequisiteIds = [];
+        $this->testCases = [];
     }
 
     public function render()
     {
         return view('components.admin.⚡exercises', [
             'categories' => Category::orderBy('sort_order')->get(),
+            'chapters' => LearningPathChapter::with('learningPath')
+                ->orderBy('learning_path_id')
+                ->orderBy('sort_order')
+                ->get(),
+            'prerequisiteOptions' => Exercise::query()
+                ->with('chapter.learningPath')
+                ->where('is_published', true)
+                ->when($this->editingId, fn ($query) => $query->where('id', '!=', $this->editingId))
+                ->orderBy('title')
+                ->get(),
             'exercises' => Exercise::with('category')
-                ->withCount('submissions')
+                ->withCount(['submissions', 'testCases'])
                 ->orderBy('sort_order')
                 ->latest()
                 ->get(),
@@ -194,6 +386,57 @@ new class extends Component
                     @error('description') <p class="text-red-400 text-sm mt-1">{{ $message }}</p> @enderror
                 </div>
 
+                <div class="rounded-xl border border-slate-700 p-5">
+                    <div class="mb-4 flex items-center justify-between gap-3">
+                        <div>
+                            <h3 class="font-semibold">Indices progressifs</h3>
+                            <p class="mt-1 text-xs text-slate-400">
+                                Ajoute jusqu’à 5 indices, révélés un par un à la demande de l’étudiant.
+                            </p>
+                        </div>
+
+                        <button type="button" wire:click="addHint" @disabled(count($hints) >= 5)
+                                class="rounded-lg bg-slate-700 px-4 py-2 text-sm hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-50">
+                            Ajouter un indice
+                        </button>
+                    </div>
+
+                    @error('hints') <p class="mb-3 text-sm text-red-400">{{ $message }}</p> @enderror
+
+                    @forelse ($hints as $index => $hint)
+                        <div wire:key="exercise-hint-{{ $index }}" class="mb-3 flex items-start gap-3">
+                            <div class="flex-1">
+                                <label for="exercise-hint-{{ $index }}" class="mb-2 block text-sm text-slate-300">
+                                    Indice {{ $index + 1 }}
+                                </label>
+                                <textarea id="exercise-hint-{{ $index }}" wire:model="hints.{{ $index }}" rows="2"
+                                          maxlength="500"
+                                          class="w-full rounded-lg border border-slate-700 bg-slate-800 p-3 text-white"></textarea>
+                                @error("hints.$index")
+                                    <p class="mt-1 text-sm text-red-400">{{ $message }}</p>
+                                @enderror
+                            </div>
+                            <button type="button" wire:click="removeHint({{ $index }})"
+                                    aria-label="Supprimer l’indice {{ $index + 1 }}"
+                                    class="mt-8 text-sm text-red-400 hover:text-red-300">
+                                Supprimer
+                            </button>
+                        </div>
+                    @empty
+                        <p class="text-sm text-slate-400">Aucun indice configuré.</p>
+                    @endforelse
+                </div>
+
+                <div>
+                    <label class="mb-2 block text-sm text-slate-300">Explication après réussite (facultative)</label>
+                    <textarea wire:model="success_explanation" rows="4" maxlength="5000"
+                              class="w-full rounded-lg border border-slate-700 bg-slate-800 p-3 text-white"
+                              placeholder="Récapitule le concept appris et pourquoi la solution fonctionne."></textarea>
+                    @error('success_explanation')
+                        <p class="mt-1 text-sm text-red-400">{{ $message }}</p>
+                    @enderror
+                </div>
+
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                     <div>
                         <label class="block text-sm text-slate-300 mb-2">Catégorie</label>
@@ -216,6 +459,9 @@ new class extends Component
                             <option value="hard">Difficile</option>
                             <option value="expert">Expert</option>
                         </select>
+                        <p class="mt-1 text-xs text-slate-400">
+                            Déblocage étudiant : facile dès le départ, moyen au niveau 2, difficile au niveau 4 et expert au niveau 6.
+                        </p>
                         @error('difficulty') <p class="text-red-400 text-sm mt-1">{{ $message }}</p> @enderror
                     </div>
 
@@ -247,6 +493,100 @@ new class extends Component
                               class="w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-white font-mono text-sm"
                               placeholder="// Écris ici le code de départ..."></textarea>
                     @error('starter_code') <p class="text-red-400 text-sm mt-1">{{ $message }}</p> @enderror
+                </div>
+
+                <div class="grid gap-5 md:grid-cols-2">
+                    <div>
+                        <label for="exercise-chapter" class="mb-2 block text-sm text-slate-300">Parcours et chapitre (facultatif)</label>
+                        <select id="exercise-chapter" wire:model="chapter_id"
+                                class="w-full rounded-lg border border-slate-700 bg-slate-800 p-3 text-white">
+                            <option value="">Exercice hors parcours</option>
+                            @foreach ($chapters as $chapter)
+                                <option value="{{ $chapter->id }}">
+                                    {{ $chapter->learningPath->title }} — {{ $chapter->title }}
+                                    @unless ($chapter->learningPath->is_published) (brouillon) @endunless
+                                </option>
+                            @endforeach
+                        </select>
+                        @error('chapter_id') <p class="mt-1 text-sm text-red-400">{{ $message }}</p> @enderror
+                    </div>
+
+                    <div>
+                        <label for="exercise-prerequisites" class="mb-2 block text-sm text-slate-300">Exercices prérequis</label>
+                        <select id="exercise-prerequisites" wire:model="prerequisiteIds" multiple size="5"
+                                class="w-full rounded-lg border border-slate-700 bg-slate-800 p-3 text-white">
+                            @foreach ($prerequisiteOptions as $prerequisite)
+                                <option value="{{ $prerequisite->id }}">
+                                    {{ $prerequisite->title }}
+                                    @if ($prerequisite->chapter)
+                                        — {{ $prerequisite->chapter->learningPath->title }} / {{ $prerequisite->chapter->title }}
+                                    @endif
+                                </option>
+                            @endforeach
+                        </select>
+                        <p class="mt-1 text-xs text-slate-400">
+                            L’étudiant devra réussir chaque exercice sélectionné. Maintiens Ctrl pour plusieurs choix.
+                        </p>
+                        @error('prerequisiteIds') <p class="mt-1 text-sm text-red-400">{{ $message }}</p> @enderror
+                        @error('prerequisiteIds.*') <p class="mt-1 text-sm text-red-400">{{ $message }}</p> @enderror
+                    </div>
+                </div>
+
+                <div class="rounded-xl border border-slate-700 p-5">
+                    <div class="mb-4 flex items-center justify-between gap-3">
+                        <div>
+                            <h3 class="font-semibold">Cas de test</h3>
+                            <p class="mt-1 text-xs text-slate-400">
+                                Utilise du JSON. Pour une fonction nommée solution, utilise par exemple {"args":[2,3],"function":"solution"}.
+                            </p>
+                        </div>
+
+                        <button type="button" wire:click="addTestCase"
+                                class="rounded-lg bg-slate-700 px-4 py-2 text-sm hover:bg-slate-600">
+                            Ajouter un test
+                        </button>
+                    </div>
+
+                    @forelse ($testCases as $index => $testCase)
+                        <div wire:key="test-case-{{ $index }}" class="mb-4 rounded-lg border border-slate-700 bg-slate-950/40 p-4">
+                            <div class="grid gap-4 md:grid-cols-2">
+                                <div>
+                                    <label class="mb-2 block text-sm text-slate-300">Entrée JSON</label>
+                                    <textarea rows="3" wire:model="testCases.{{ $index }}.input"
+                                              class="w-full rounded-lg border border-slate-700 bg-slate-900 p-3 font-mono text-sm text-white"></textarea>
+                                    @error("testCases.$index.input")
+                                        <p class="mt-1 text-sm text-red-400">{{ $message }}</p>
+                                    @enderror
+                                </div>
+
+                                <div>
+                                    <label class="mb-2 block text-sm text-slate-300">Résultat attendu JSON</label>
+                                    <textarea rows="3" wire:model="testCases.{{ $index }}.expected"
+                                              class="w-full rounded-lg border border-slate-700 bg-slate-900 p-3 font-mono text-sm text-white"></textarea>
+                                    @error("testCases.$index.expected")
+                                        <p class="mt-1 text-sm text-red-400">{{ $message }}</p>
+                                    @enderror
+                                </div>
+                            </div>
+
+                            <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
+                                <label class="flex items-center gap-2 text-sm text-slate-300">
+                                    <input type="checkbox" wire:model="testCases.{{ $index }}.hidden"
+                                           class="h-4 w-4 rounded">
+                                    Test caché
+                                </label>
+
+                                <button type="button" wire:click="removeTestCase({{ $index }})"
+                                        class="text-sm text-red-400 hover:text-red-300">
+                                    Supprimer ce test
+                                </button>
+                            </div>
+                        </div>
+                    @empty
+                        <p class="text-sm text-slate-400">
+                            Aucun cas de test. Les soumissions resteront en erreur jusqu’à l’ajout d’un test.
+                        </p>
+                    @endforelse
                 </div>
 
                 <label class="flex items-center gap-3 text-slate-300">
@@ -282,6 +622,7 @@ new class extends Component
                             <th class="p-3">Catégorie</th>
                             <th class="p-3">Difficulté</th>
                             <th class="p-3">XP</th>
+                            <th class="p-3">Tests</th>
                             <th class="p-3">Soumissions</th>
                             <th class="p-3">Statut</th>
                             <th class="p-3">Actions</th>
@@ -295,6 +636,7 @@ new class extends Component
                                 <td class="p-3 text-slate-300">{{ $exercise->category->name }}</td>
                                 <td class="p-3">{{ $exercise->difficulty }}</td>
                                 <td class="p-3">{{ $exercise->xp_reward }} XP</td>
+                                <td class="p-3">{{ $exercise->test_cases_count }}</td>
                                 <td class="p-3">{{ $exercise->submissions_count }}</td>
                                 <td class="p-3">
                                     @if ($exercise->is_published)
@@ -326,7 +668,7 @@ new class extends Component
                             </tr>
                         @empty
                             <tr>
-                                <td colspan="7" class="p-6 text-center text-slate-400">
+                                <td colspan="8" class="p-6 text-center text-slate-400">
                                     Aucun exercice enregistré pour le moment.
                                 </td>
                             </tr>

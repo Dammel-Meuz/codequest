@@ -22,6 +22,12 @@ new class extends Component
                     $query->where('user_id', auth()->id());
                 }
             ])
+            ->withCount('prerequisites')
+            ->withCount([
+                'prerequisites as completed_prerequisites_count' => fn ($query) => $query
+                    ->whereHas('completions', fn ($completions) => $completions
+                        ->where('user_id', auth()->id())),
+            ])
             ->where('is_published', true)
             ->when($this->search, function ($query) {
                 $query->where('title', 'like', '%' . $this->search . '%');
@@ -37,6 +43,7 @@ new class extends Component
 
         return view('components.student.⚡exercises', [
             'exercises' => $exercises,
+            'currentLevelNumber' => auth()->user()->currentLevelNumber(),
             'categories' => Category::where('is_active', true)
                 ->orderBy('sort_order')
                 ->get(),
@@ -127,8 +134,19 @@ new class extends Component
             <div class="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
 
                 @foreach ($exercises as $exercise)
+                    @php
+                        $isLevelUnlocked = $currentLevelNumber >= $exercise->requiredLevelNumber();
+                        $hasCompletedPrerequisites = (int) $exercise->prerequisites_count
+                            === (int) $exercise->completed_prerequisites_count;
+                        $isUnlocked = (bool) $exercise->is_completed
+                            || ($isLevelUnlocked && $hasCompletedPrerequisites);
+                    @endphp
 
-                    <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 transition hover:border-indigo-500">
+                    <div @class([
+                        'rounded-2xl border bg-slate-900 p-6 transition',
+                        'border-slate-800 hover:border-indigo-500' => $isUnlocked,
+                        'border-amber-500/30 opacity-80' => ! $isUnlocked,
+                    ])>
 
                        
                         <div class="mb-4 flex items-center justify-between">
@@ -137,7 +155,15 @@ new class extends Component
                             </span>
 
                             <div class="flex items-center gap-2">
-                                @if ($exercise->is_completed)
+                                @if (! $isUnlocked)
+                                    <span class="rounded-full bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-300">
+                                        @if (! $isLevelUnlocked)
+                                            Verrouillé — niveau {{ $exercise->requiredLevelNumber() }}
+                                        @else
+                                            Verrouillé — prérequis
+                                        @endif
+                                    </span>
+                                @elseif ($exercise->is_completed)
                                     <span class="rounded-full bg-green-500/10 px-3 py-1 text-xs font-medium text-green-400">
                                         Terminé
                                     </span>
@@ -180,10 +206,20 @@ new class extends Component
                                 @endswitch
                             </span>
 
-                            <a href="{{ route('student.exercise-show', $exercise->id) }}"
-                            class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700">
-                                Résoudre l'exercice
-                            </a>
+                            @if ($isUnlocked)
+                                <a href="{{ route('student.exercise-show', $exercise->id) }}"
+                                   class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700">
+                                    Résoudre l'exercice
+                                </a>
+                            @else
+                                <span class="rounded-lg bg-slate-800 px-4 py-2 text-xs text-slate-400">
+                                    @if (! $isLevelUnlocked)
+                                        Atteins le niveau {{ $exercise->requiredLevelNumber() }}
+                                    @else
+                                        Réussis les exercices prérequis
+                                    @endif
+                                </span>
+                            @endif
                         </div>
 
                     </div>

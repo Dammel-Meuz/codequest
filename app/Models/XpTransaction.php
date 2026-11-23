@@ -11,6 +11,8 @@ class XpTransaction extends Model
     protected $fillable = [
         'user_id',
         'submission_id',
+        'chapter_quiz_completion_id',
+        'weekly_quest_progress_id',
         'amount',
         'reason',
         'description',
@@ -38,6 +40,16 @@ class XpTransaction extends Model
     public function submission(): BelongsTo
     {
         return $this->belongsTo(Submission::class);
+    }
+
+    public function chapterQuizCompletion(): BelongsTo
+    {
+        return $this->belongsTo(ChapterQuizCompletion::class);
+    }
+
+    public function weeklyQuestProgress(): BelongsTo
+    {
+        return $this->belongsTo(WeeklyQuestProgress::class);
     }
 }
 

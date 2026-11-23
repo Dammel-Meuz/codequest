@@ -2,6 +2,7 @@
 <?php
 
 use App\Models\User;
+use Illuminate\Auth\Events\Registered;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Validation\Rules\Password;
 use Livewire\Component;
@@ -36,23 +37,24 @@ new class extends Component
             'role' => 'student',
         ]);
 
+        event(new Registered($user));
+
         Auth::login($user);
 
-        request()->session()->regenerate();
+        session()->regenerate();
 
-        return redirect()->route('dashboard');
+        return redirect()->route('verification.notice');
     }
     public function render()
 {
     return view('components.auth.⚡register')
-        ->layout('layouts.app');
+        ->layout('layouts.app', ['title' => 'Inscription']);
 }
 };
 ?>
 
-@component('layouts.app', ['title' => 'Inscription'])
-    <div class="min-h-screen bg-slate-950 text-slate-100">
-        <div class="mx-auto flex min-h-screen max-w-6xl items-center justify-center px-4 py-12 sm:px-6 lg:px-8">
+<div class="min-h-screen bg-slate-950 text-slate-100">
+    <div class="mx-auto flex min-h-screen max-w-6xl items-center justify-center px-4 py-12 sm:px-6 lg:px-8">
             <div class="grid w-full max-w-5xl overflow-hidden rounded-3xl border border-white/10 bg-white/5 shadow-2xl shadow-slate-950/40 backdrop-blur-sm lg:grid-cols-[1.1fr_1fr]">
                 <div class="flex flex-col justify-between bg-gradient-to-br from-indigo-600 via-violet-600 to-cyan-500 p-8 sm:p-10">
                     <div>
@@ -157,6 +159,5 @@ new class extends Component
                     </p>
                 </div>
             </div>
-        </div>
     </div>
-@endcomponent
+</div>
